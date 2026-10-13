@@ -47,7 +47,6 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------------------
 
 COMPARE_COLS: list[str] = [
-    "Filename",
     "Organisation_Cd",
     "Region_Cd",
     "Template_Version",
@@ -76,7 +75,6 @@ COMPARE_COLS: list[str] = [
 #   - Flat_File: Measure_Cd
 #   - Semantic:  Legacy_Measure_Reference
 KEY_COLS: list[str] = [
-    "Filename",
     "Organisation_Cd",
     "Region_Cd",
     "Submission_Period_Cd",
@@ -117,7 +115,6 @@ SEMANTIC_TO_FLAT_COL_MAP: dict[str, str] = {
 # --------------------------------------------------------------------------------------
 
 CCP_COMPARE_COLS: list[str] = [
-    "Filename",
     "Organisation_Cd",
     "Assurance_Cd",
     "Observation_Cd",
@@ -143,7 +140,6 @@ CCP_COMPARE_COLS: list[str] = [
 ]
 
 CCP_KEY_COLS: list[str] = [
-    "Filename",
     "Organisation_Cd",
     "Submission_Period_Cd",
     "Observation_Period_Cd",
@@ -181,14 +177,16 @@ CCP_KEY_COLS: list[str] = [
     "Price_Index_Coverage_Cd",
 ]
 
-CCP_CONTEXT_COLS: list[str] = CCP_KEY_COLS[:]  # context == key for CCP
+CCP_CONTEXT_COLS: list[str] = [
+    "Filename",
+    *CCP_KEY_COLS,
+] # context == key for CCP
 
 # --------------------------------------------------------------------------------------
 # MEX COLUMN CONSTANTS
 # --------------------------------------------------------------------------------------
 
 MEX_COMPARE_COLS: list[str] = [
-    "Filename",
     "Organisation_Cd",
     "Assurance_Cd",
     "Measure_Cd",
@@ -208,7 +206,6 @@ MEX_COMPARE_COLS: list[str] = [
 ]
 
 MEX_KEY_COLS: list[str] = [
-    "Filename",
     "Organisation_Cd",
     "Submission_Period_Cd",
     "Observation_Period_Cd",
@@ -222,15 +219,7 @@ MEX_KEY_COLS: list[str] = [
 
 MEX_CONTEXT_COLS: list[str] = [
     "Filename",
-    "Organisation_Cd",
-    "Submission_Period_Cd",
-    "Observation_Period_Cd",
-    "Measure_Cd",
-    "Observation_Cd",
-    "Observation_Coverage_Cd",
-    "Data_Source_Cd",
-    "Sensitivity_Cd",
-    "DMeX_Metric_Cd",
+    *MEX_KEY_COLS,
     "Sheet_Cd",
 ]
 
@@ -934,17 +923,63 @@ def prepare_qa_frames(
     log.info("Flat_File rows AFTER key normalisation: %d", len(flat_for_qa))
     log.info("Semantic rows AFTER key normalisation: %d", len(sem_for_qa))
 
-    # 5) Dedupe semantic by latest Insert_Date per key
-    if "Insert_Date" in sem_for_qa.columns and not sem_for_qa.empty:
-        sem_for_qa["_Insert_Date_ts"] = pd.to_datetime(sem_for_qa["Insert_Date"], errors="coerce")
-        sem_for_qa = sem_for_qa.sort_values(
-            key_cols + ["_Insert_Date_ts"],
-            ascending=[True] * len(key_cols) + [False],
-        )
-        sem_for_qa = sem_for_qa.drop_duplicates(subset=key_cols, keep="first")
-        sem_for_qa = sem_for_qa.drop(columns=["_Insert_Date_ts"])
+    # 5) Select latest ingested version per business key
+    # Supports append-only incremental ingestion.
 
-    log.info("Semantic rows AFTER dedupe: %d", len(sem_for_qa))
+    if not sem_for_qa.empty:
+
+        if "Insert_Date" not in sem_for_qa.columns:
+            raise ValueError(
+                f"Insert_Date missing from ingested data "
+                f"for profile {p}."
+            )
+
+        sem_for_qa["_Insert_Date_ts"] = pd.to_datetime(
+            sem_for_qa["Insert_Date"],
+            errors="coerce",
+            utc=True,
+        )
+
+        if sem_for_qa["_Insert_Date_ts"].isna().any():
+            raise ValueError(
+                "Null or invalid Insert_Date found in ingested data."
+            )
+
+        before_count = len(sem_for_qa)
+
+        # Latest timestamp for each natural business key
+        latest_timestamps = (
+            sem_for_qa
+            .groupby(key_cols, dropna=False)["_Insert_Date_ts"]
+            .transform("max")
+        )
+
+        sem_for_qa = sem_for_qa[
+            sem_for_qa["_Insert_Date_ts"] == latest_timestamps
+        ].copy()
+
+        # Multiple rows at the latest timestamp are ambiguous
+        conflicting = sem_for_qa[
+            sem_for_qa.duplicated(subset=key_cols, keep=False)
+        ]
+
+        if not conflicting.empty:
+            raise ValueError(
+                f"Conflicting latest ingested records for {p}. "
+                f"Found {len(conflicting)} rows sharing a "
+                "business key and the latest Insert_Date. "
+                f"Sample: {conflicting[key_cols].head(5).to_dict('records')}"
+            )
+
+        sem_for_qa = sem_for_qa.drop(
+            columns=["_Insert_Date_ts"]
+        )
+
+        log.info(
+            "Incremental QA: %d historical rows -> %d latest records",
+            before_count,
+            len(sem_for_qa),
+        )
 
     return flat_for_qa, sem_for_qa
 
@@ -1099,14 +1134,20 @@ def build_qa_diff(
         log.info("Rows present in BOTH (after full join): %d", len(both))
 
         ignore_cols = {
+            "Filename",
+            "Archive_Filename",
             "Insert_Date",
             "Batch_Id",
             "QA_Run_Datetime",
+            "pk",
+            "file_hash_md5",
         }
 
         configured_common_cols = [
             c for c in compare_cols
-            if f"{c}_raw" in both.columns and f"{c}_ingested" in both.columns
+            if c not in ignore_cols
+            and f"{c}_raw" in both.columns
+            and f"{c}_ingested" in both.columns
         ]
 
         dynamic_common_cols = [
@@ -1137,15 +1178,36 @@ def build_qa_diff(
             return ~(both_na | equal_values)
 
         def _measure_value_diff_mask_ccp(df: pd.DataFrame) -> pd.Series:
-            col_raw = "Measure_Value_raw"
-            col_ing = "Measure_Value_ingested"
+            raw_text = _normalise_string(df["Measure_Value_raw"])
+            ing_text = _normalise_string(df["Measure_Value_ingested"])
 
-            raw_num = pd.to_numeric(df[col_raw].astype(str).str.strip().str.replace("%", "", regex=False), errors="coerce")
-            ing_num = pd.to_numeric(df[col_ing].astype(str).str.strip().str.replace("%", "", regex=False), errors="coerce")
+            raw_num = pd.to_numeric(
+                raw_text.str.replace("%", "", regex=False),
+                errors="coerce",
+            )
 
-            both_na = raw_num.isna() & ing_num.isna()
-            equal_values = raw_num == ing_num
-            return ~(both_na | equal_values)
+            ing_num = pd.to_numeric(
+                ing_text.str.replace("%", "", regex=False),
+                errors="coerce",
+            )
+
+            both_numeric = raw_num.notna() & ing_num.notna()
+
+            equal_values = pd.Series(False, index=df.index)
+
+            # Compare numeric values numerically
+            equal_values.loc[both_numeric] = (
+                raw_num.loc[both_numeric]
+                == ing_num.loc[both_numeric]
+            )
+
+            # Compare nonnumeric values as normalised strings
+            equal_values.loc[~both_numeric] = (
+                raw_text.loc[~both_numeric]
+                == ing_text.loc[~both_numeric]
+            )
+
+            return ~equal_values
 
         for col in common_cols:
             col_raw = f"{col}_raw"
@@ -1177,8 +1239,25 @@ def build_qa_diff(
                     err_type = f"{col.upper()}_MISMATCH"
 
             diff_rows = both[mask_diff]
+
             for _, row in diff_rows.iterrows():
-                context = {k: row.get(k) for k in context_cols if k in both.columns}
+                context = {
+                    k: row.get(k)
+                    for k in context_cols
+                    if k in both.columns
+                }
+
+                # Preserve source filename for QA error traceability.
+                # Filename is metadata, not part of the natural key.
+                if "Filename_raw" in row.index:
+                    context["Filename"] = row["Filename_raw"]
+
+                elif "Filename" in row.index:
+                    context["Filename"] = row["Filename"]
+
+                elif "Filename_ingested" in row.index:
+                    context["Filename"] = row["Filename_ingested"]
+
                 raw_val = row.get(col_raw)
                 ing_val = row.get(col_ing)
 
