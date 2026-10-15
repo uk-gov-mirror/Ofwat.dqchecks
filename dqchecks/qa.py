@@ -798,8 +798,11 @@ def prepare_qa_frames(
     target_org: Optional[str] = None,
     semantic_to_flat_map: Optional[dict[str, str]] = None,
     logger_: Optional[logging.Logger] = None,
-    profile: str = "QD",
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    profile: str = "QD", return_conflicts: bool = False,
+) -> (
+    Tuple[pd.DataFrame, pd.DataFrame]
+    | Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+):
     """
     Prepare Flat_File and semantic DataFrames for QA.
 
@@ -926,12 +929,13 @@ def prepare_qa_frames(
     # 5) Select latest ingested version per business key
     # Supports append-only incremental ingestion.
 
+    latest_conflicts_df = sem_for_qa.iloc[0:0].copy()
+
     if not sem_for_qa.empty:
 
         if "Insert_Date" not in sem_for_qa.columns:
             raise ValueError(
-                f"Insert_Date missing from ingested data "
-                f"for profile {p}."
+                f"Insert_Date missing from ingested data for profile {p}."
             )
 
         sem_for_qa["_Insert_Date_ts"] = pd.to_datetime(
@@ -947,7 +951,7 @@ def prepare_qa_frames(
 
         before_count = len(sem_for_qa)
 
-        # Latest timestamp for each natural business key
+        # Select latest timestamp for each natural business key
         latest_timestamps = (
             sem_for_qa
             .groupby(key_cols, dropna=False)["_Insert_Date_ts"]
@@ -958,20 +962,38 @@ def prepare_qa_frames(
             sem_for_qa["_Insert_Date_ts"] == latest_timestamps
         ].copy()
 
-        # Multiple rows at the latest timestamp are ambiguous
-        conflicting = sem_for_qa[
+        # Identify duplicate records at the latest timestamp
+        latest_conflicts_df = sem_for_qa[
             sem_for_qa.duplicated(subset=key_cols, keep=False)
-        ]
+        ].copy()
 
-        if not conflicting.empty:
-            raise ValueError(
-                f"Conflicting latest ingested records for {p}. "
-                f"Found {len(conflicting)} rows sharing a "
-                "business key and the latest Insert_Date. "
-                f"Sample: {conflicting[key_cols].head(5).to_dict('records')}"
+        if not latest_conflicts_df.empty:
+            conflict_key_count = len(
+                latest_conflicts_df[key_cols].drop_duplicates()
             )
 
+            log.warning(
+                "Incremental QA: %d conflicting latest rows "
+                "across %d business keys for %s. "
+                "These will be reported as QA errors.",
+                len(latest_conflicts_df),
+                conflict_key_count,
+                p,
+            )
+
+        # Retain one representative per key for key-overlap counts.
+        # Ambiguous keys will be excluded from value comparisons
+        # in the notebook and reported separately as QA errors.
+        sem_for_qa = sem_for_qa.drop_duplicates(
+            subset=key_cols,
+            keep="first",
+        ).copy()
+
         sem_for_qa = sem_for_qa.drop(
+            columns=["_Insert_Date_ts"]
+        )
+
+        latest_conflicts_df = latest_conflicts_df.drop(
             columns=["_Insert_Date_ts"]
         )
 
@@ -981,8 +1003,18 @@ def prepare_qa_frames(
             len(sem_for_qa),
         )
 
-    return flat_for_qa, sem_for_qa
+    # Preserve existing two-value return behaviour
+    if not return_conflicts and not latest_conflicts_df.empty:
+        log.warning(
+            "%d conflicting latest ingested rows were detected but "
+            "not returned because return_conflicts=False.",
+            len(latest_conflicts_df),
+        )
 
+    if return_conflicts:
+        return flat_for_qa, sem_for_qa, latest_conflicts_df
+
+    return flat_for_qa, sem_for_qa
 
 # --------------------------------------------------------------------------------------
 # 2) KEY-LEVEL MATCHING
@@ -1564,9 +1596,24 @@ def build_qa_summaries(
     key_cols_for_diff = [c for c in key_cols if c in qa_diff_df.columns]
 
     if not qa_diff_df.empty and key_cols_for_diff:
-        keys_with_any_error = qa_diff_df[key_cols_for_diff].drop_duplicates()
-        total_rows_with_mismatches = len(keys_with_any_error)
-        total_matched_rows = rows_with_keys_in_both - total_rows_with_mismatches
+        keys_with_any_error = (
+            qa_diff_df[key_cols_for_diff]
+            .drop_duplicates()
+        )
+
+        # Only errors on genuinely overlapping business keys
+        # should reduce the matched-row count.
+        matched_key_errors = keys_in_both.merge(
+            keys_with_any_error,
+            on=key_cols_for_diff,
+            how="inner",
+        ).drop_duplicates(subset=key_cols_for_diff)
+
+        total_rows_with_mismatches = len(matched_key_errors)
+
+        total_matched_rows = (
+            rows_with_keys_in_both - total_rows_with_mismatches
+        )
 
         columns_affected = ", ".join(sorted(qa_diff_df["Column_Name"].dropna().unique()))
         error_types = ", ".join(sorted(qa_diff_df["Error_Type"].dropna().unique()))
@@ -1604,7 +1651,11 @@ def build_qa_summaries(
         keys_in_both_by_org = pd.DataFrame(columns=["Organisation_Cd", "Rows_With_Keys_In_Both"])
 
     if not qa_diff_df.empty and key_cols_for_diff and "Organisation_Cd" in qa_diff_df.columns:
-        base_for_org = qa_diff_df[key_cols_for_diff].drop_duplicates()
+        base_for_org = keys_in_both.merge(
+            qa_diff_df[key_cols_for_diff].drop_duplicates(),
+            on=key_cols_for_diff,
+            how="inner",
+        ).drop_duplicates(subset=key_cols_for_diff)
 
         rows_with_mismatches_by_org = base_for_org.groupby("Organisation_Cd").size().reset_index(name="Total_Rows_With_Mismatches")
         cell_diff_by_org = qa_diff_df.groupby("Organisation_Cd").size().reset_index(name="Total_Cell_Level_Differences")
